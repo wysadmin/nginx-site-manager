@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nginx 反向代理 & SSL 交互式管理工具
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_URL="https://raw.githubusercontent.com/wysadmin/nginx-site-manager/main/site.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
@@ -53,6 +53,13 @@ EOF
 # 封禁外部直接访问后端端口（仅允许本地 127.0.0.1 Nginx 转发）
 block_external_port() {
     local port=$1
+    # 80/443 为网站对外端口，封禁会导致站点无法访问
+    case "$port" in
+        80|443)
+            echo "⚠️ 端口 ${port} 是网站对外端口，已跳过封禁。"
+            return
+            ;;
+    esac
     if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
         ufw deny "${port}/tcp" >/dev/null 2>&1
         echo "🛡️ 已通过 UFW 禁止外部直接访问 ${port} 端口"
@@ -89,6 +96,97 @@ unblock_external_port() {
             ip6tables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
         fi
     fi
+}
+# 列出当前对外封禁的端口
+list_blocked_ports() {
+    echo "------------------------------------------"
+    echo "🔍 当前对外封禁的端口："
+    local found=0
+    local lines
+    lines=$({
+        if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw status 2>/dev/null | awk '/^[0-9]+\/tcp[[:space:]]+DENY/ {split($1,a,"/"); print a[1]"|UFW DENY"}'
+        fi
+        if command -v iptables &> /dev/null; then
+            iptables -S INPUT 2>/dev/null | awk '/-j DROP/ {for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)"|iptables DROP"}'
+        fi
+    } | sort -u)
+    if [ -n "$lines" ]; then
+        echo "$lines" | while IFS='|' read -r p src; do
+            [ -n "$p" ] && echo "  • 端口 ${p}  [${src}]"
+        done
+        found=1
+    fi
+    if [ "$found" -eq 0 ]; then
+        echo "  (暂无封禁规则)"
+    fi
+    if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        echo "  ℹ️ Firewalld 模式通过移除放行实现，当前放行端口："
+        echo "     $(firewall-cmd --list-ports 2>/dev/null)"
+    fi
+    echo "------------------------------------------"
+}
+# 解析用户输入的端口（支持空格/逗号分隔的多个端口）
+parse_ports() {
+    echo "$1" | tr ',' ' ' | tr -s ' \t' '\n' | grep -E '^[0-9]+$'
+}
+# 对外端口封禁管理（独立功能）
+port_guard_menu() {
+    while true; do
+        echo ""
+        echo ">>> [对外端口封禁管理]"
+        echo "  1. 封禁端口 (禁止外部直连，仅允许本机 Nginx 转发)"
+        echo "  2. 解除端口封禁"
+        echo "  3. 查看当前封禁列表"
+        echo "  0. 返回主菜单"
+        read -p "请选择操作 [0-3]: " PCH
+        case "$PCH" in
+            1)
+                echo ""
+                list_blocked_ports
+                read -p "请输入要封禁的端口 (多个用空格或逗号分隔，例如 8070 8090): " PORTS_IN
+                local plist cnt
+                plist=$(parse_ports "$PORTS_IN")
+                if [ -z "$plist" ]; then
+                    echo "❌ 未识别到有效端口号。"
+                    continue
+                fi
+                cnt=0
+                for p in $plist; do
+                    block_external_port "$p"
+                    cnt=$((cnt + 1))
+                done
+                echo "🎉 封禁流程执行完毕，共处理 ${cnt} 个端口。"
+                echo "ℹ️ 说明：封禁只拦截外部直连，本机 127.0.0.1 转发不受影响。"
+                ;;
+            2)
+                echo ""
+                list_blocked_ports
+                read -p "请输入要解除封禁的端口 (多个用空格或逗号分隔): " PORTS_OUT
+                local olist
+                olist=$(parse_ports "$PORTS_OUT")
+                if [ -z "$olist" ]; then
+                    echo "❌ 未识别到有效端口号。"
+                    continue
+                fi
+                for p in $olist; do
+                    unblock_external_port "$p"
+                    echo "✅ 已解除端口 ${p} 的外部封禁"
+                done
+                echo "ℹ️ 若 Firewalld 模式下需重新放行，请自行执行: firewall-cmd --permanent --add-port=<端口>/tcp && firewall-cmd --reload"
+                ;;
+            3)
+                echo ""
+                list_blocked_ports
+                ;;
+            0)
+                return
+                ;;
+            *)
+                echo "❌ 无效选项，请输入 0 到 3 之间的数字。"
+                ;;
+        esac
+    done
 }
 # 下载远程文件（curl 优先，其次 wget）
 fetch_url() {
@@ -391,18 +489,20 @@ while true; do
     echo "  1. 添加新站点 (反代 + 禁IP访问 + SSL)"
     echo "  2. 删除现有站点 (清理配置 + 证书)"
     echo "  3. 查看当前所有站点及状态"
-    echo "  4. 检测脚本更新 (对比远端并升级)"
+    echo "  4. 对外端口封禁管理 (禁止/解除外部直连)"
+    echo "  5. 检测脚本更新 (对比远端并升级)"
     echo "  9. 卸载本管理工具"
     echo "  0. 退出"
     echo "=========================================="
-    read -p "请选择操作 [0-4/9]: " CHOICE
+    read -p "请选择操作 [0-5/9]: " CHOICE
     case "$CHOICE" in
         1) add_site ;;
         2) del_site ;;
         3) list_sites ;;
-        4) check_update ;;
+        4) port_guard_menu ;;
+        5) check_update ;;
         9) uninstall_self ;;
         0) echo "已退出。"; exit 0 ;;
-        *) echo "❌ 无效选项，请输入 0-4 或 9。" ;;
+        *) echo "❌ 无效选项，请输入 0-5 或 9。" ;;
     esac
 done
