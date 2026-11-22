@@ -22,6 +22,23 @@ sudo rm -f /usr/local/bin/site
 
 
 ```
+
+## 彻底清理（卸载脚本 + 清理所有网站配置、拦截规则与 SSL 证书）
+
+```bash
+# 1. 删除全局命令
+sudo rm -f /usr/local/bin/site
+
+# 2. 删除默认拒绝 IP 访问规则及通过本工具生成的站点配置
+sudo rm -f /etc/nginx/conf.d/00-default-deny.conf
+# （可选）如需清空 conf.d 下所有站点配置，请取消下一行的注释：
+# sudo rm -f /etc/nginx/conf.d/*.conf
+
+# 3. 重载 Nginx 使清理生效
+sudo nginx -t && sudo systemctl reload nginx
+
+
+```
 ## 功能列表
 - **自动环境初始化**：自动检测并安装 `nginx` 和 `certbot`（兼容 Ubuntu/Debian 与 CentOS/Rocky/AlmaLinux）。
 - **添加新站点**：输入域名和本地端口，自动生成反代配置（含 WebSocket 支持与大文件上传限制）并调用 Certbot 申请证书。
