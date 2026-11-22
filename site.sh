@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nginx 反向代理 & SSL 交互式管理工具
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_URL="https://raw.githubusercontent.com/wysadmin/nginx-site-manager/main/site.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
@@ -325,6 +325,123 @@ trace_port_hits() {
     fi
     echo "💡 结论优先级：若两条链都不命中，最稳的做法是让容器只监听本机：ports 改成 \"127.0.0.1:${tport}:${tport}\""
 }
+# 列出 Docker 容器中绑定在 0.0.0.0 的发布端口：输出 name|hostport|innerport
+list_exposed_docker_ports() {
+    docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null | awk -F'|' '{
+        n=$1; p=$2; gsub(/,/," ",p);
+        cnt=split(p,a," ");
+        for (i=1;i<=cnt;i++) {
+            if (a[i] ~ /^0\.0\.0\.0:/ && a[i] ~ /->/) {
+                split(a[i], b, "->");
+                hp=b[1]; sub(/^0\.0\.0\.0:/,"",hp);
+                inn=b[2]; sub(/\/.*/,"",inn);
+                print n"|"hp"|"inn;
+            }
+        }
+    }'
+}
+# 把某个容器的发布端口改绑到 127.0.0.1（改 compose + 备份 + 校验 + 重建，失败回滚）
+bind_localhost() {
+    local name=$1
+    local cfg proj bak
+    cfg=$(docker inspect "$name" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null)
+    proj=$(docker inspect "$name" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null)
+    if [ -z "$cfg" ] || [ ! -f "$cfg" ]; then
+        echo "❌ 未找到 compose 文件（可能由面板或 docker run 启动），无法自动改绑。"
+        echo "💡 请在面板的端口绑定设置里把主机地址改成 127.0.0.1。"
+        return
+    fi
+    if [ -z "$proj" ]; then
+        proj=$(basename "$(dirname "$cfg")")
+    fi
+    echo "ℹ️ compose: ${cfg}"
+    echo "ℹ️ 项目名: ${proj}"
+    bak="${cfg}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -f "$cfg" "$bak" && echo "💾 已备份: ${bak}"
+
+    local hp inn changed=0
+    while IFS='|' read -r n hp inn; do
+        [ "$n" = "$name" ] || continue
+        case "$hp" in
+            80|443)
+                echo "⚠️ 端口 ${hp} 是网站对外端口，跳过改绑（否则站点会不可访问）"
+                continue
+                ;;
+        esac
+        if grep -qE "\"${hp}:${inn}\"|\"0\.0\.0\.0:${hp}:${inn}\"|[[:space:]]- ${hp}:${inn}$" "$cfg"; then
+            sed -i -E "s#\"0\.0\.0\.0:${hp}:${inn}\"#\"127.0.0.1:${hp}:${inn}\"#g; s#\"${hp}:${inn}\"#\"127.0.0.1:${hp}:${inn}\"#g; s#^([[:space:]]*)- ${hp}:${inn}\$#\1- \"127.0.0.1:${hp}:${inn}\"#g" "$cfg"
+            echo "✏️ ${name}: ${hp}:${inn}  ->  127.0.0.1:${hp}:${inn}"
+            changed=$((changed + 1))
+        fi
+    done < <(list_exposed_docker_ports)
+
+    if [ "$changed" -eq 0 ]; then
+        echo "⚠️ 没有匹配到需要修改的端口写法，请手动编辑 ${cfg}"
+        return
+    fi
+
+    # 校验：compose 解析后必须出现 host_ip: 127.0.0.1
+    if ! docker compose -f "$cfg" -p "$proj" config 2>/dev/null | grep -q "host_ip: 127.0.0.1"; then
+        echo "❌ 配置校验未通过（可能写法不是标准 ports 列表），已回滚。"
+        cp -f "$bak" "$cfg"
+        return
+    fi
+    echo "✅ YAML 校验通过，开始重建容器..."
+    if docker compose -f "$cfg" -p "$proj" up -d --force-recreate 2>&1 | tail -n 6; then
+        echo "✅ 重建完成。当前端口绑定："
+        docker ps --format 'table {{.Names}}\t{{.Ports}}' | grep -E "^${name}|NAMES" || true
+        echo "ℹ️ 若外部仍能访问，请确认容器是否已重建、以及面板是否会重写 compose 文件。"
+    else
+        echo "❌ 重建失败，正在回滚配置..."
+        cp -f "$bak" "$cfg"
+        docker compose -f "$cfg" -p "$proj" up -d --force-recreate >/dev/null 2>&1
+        echo "↩️ 已回滚到改绑前状态。"
+    fi
+}
+# Docker 对外端口巡检（发现 0.0.0.0 绑定并可一键改绑）
+audit_docker_bind() {
+    echo ""
+    echo ">>> [Docker 对外端口巡检]"
+    if ! command -v docker &> /dev/null; then
+        echo "❌ 未安装 Docker。"
+        return
+    fi
+    local rows
+    rows=$(list_exposed_docker_ports)
+    if [ -z "$rows" ]; then
+        echo "✅ 未发现绑定 0.0.0.0 的容器端口，容器端口均只对本机开放。"
+        return
+    fi
+    echo "⚠️ 以下容器端口绑定在 0.0.0.0，外部可直接访问 IP:端口："
+    echo "$rows" | while IFS='|' read -r n hp inn; do
+        echo "  • ${n}  发布端口 ${hp} -> 容器内 ${inn}"
+    done
+    echo ""
+    echo "🔧 推荐做法：改成 \"127.0.0.1:发布端口:容器内端口\"，外部连 SYN 都到不了，Nginx 反代不受影响"
+    echo "$rows" | while IFS='|' read -r n hp inn; do
+        local cfg
+        cfg=$(docker inspect "$n" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null)
+        if [ -n "$cfg" ]; then
+            echo "  ${n}: 编辑 ${cfg}，把 \"${hp}:${inn}\" 改成 \"127.0.0.1:${hp}:${inn}\""
+        else
+            echo "  ${n}: 非 compose 管理，请在面板/启动参数里把主机绑定地址改成 127.0.0.1"
+        fi
+    done
+    echo ""
+    read -p "输入要自动改绑的容器名（回车跳过）: " TARGET
+    [ -z "$TARGET" ] && return
+    if ! docker inspect "$TARGET" >/dev/null 2>&1; then
+        echo "❌ 容器 ${TARGET} 不存在。"
+        return
+    fi
+    echo "⚠️ 改绑需要重建该容器，服务会短暂中断（通常几秒）。"
+    read -p "确认对 ${TARGET} 执行改绑？(y/N): " GO
+    if [[ "$GO" != "y" && "$GO" != "Y" ]]; then
+        echo "已取消。"
+        return
+    fi
+    bind_localhost "$TARGET"
+}
 # 对外端口封禁管理（独立功能）
 port_guard_menu() {
     while true; do
@@ -335,8 +452,9 @@ port_guard_menu() {
         echo "  3. 查看当前封禁列表"
         echo "  4. 排障诊断 (监听端口 + 防火墙规则)"
         echo "  5. 命中定位 (埋 LOG 看包落在哪条链)"
+        echo "  6. Docker 对外端口巡检 (0.0.0.0 绑定 → 一键改绑)"
         echo "  0. 返回主菜单"
-        read -p "请选择操作 [0-5]: " PCH
+        read -p "请选择操作 [0-6]: " PCH
         case "$PCH" in
             1)
                 echo ""
@@ -382,11 +500,14 @@ port_guard_menu() {
             5)
                 trace_port_hits
                 ;;
+            6)
+                audit_docker_bind
+                ;;
             0)
                 return
                 ;;
             *)
-                echo "❌ 无效选项，请输入 0 到 5 之间的数字。"
+                echo "❌ 无效选项，请输入 0 到 6 之间的数字。"
                 ;;
         esac
     done
