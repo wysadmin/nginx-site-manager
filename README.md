@@ -15,7 +15,13 @@ sudo curl -fsSL https://raw.githubusercontent.com/wysadmin/nginx-site-manager/ma
 ```bash
 sudo site
 ```
+## 一键卸载
 
+```bash
+sudo rm -f /usr/local/bin/site
+
+
+```
 ## 功能列表
 - **自动环境初始化**：自动检测并安装 `nginx` 和 `certbot`（兼容 Ubuntu/Debian 与 CentOS/Rocky/AlmaLinux）。
 - **添加新站点**：输入域名和本地端口，自动生成反代配置（含 WebSocket 支持与大文件上传限制）并调用 Certbot 申请证书。
