@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nginx 反向代理 & SSL 交互式管理工具
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_URL="https://raw.githubusercontent.com/wysadmin/nginx-site-manager/main/site.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
@@ -53,6 +53,7 @@ EOF
 # 封禁外部直接访问后端端口（仅允许本地 127.0.0.1 Nginx 转发）
 block_external_port() {
     local port=$1
+    local i
     # 80/443 为网站对外端口，封禁会导致站点无法访问
     case "$port" in
         80|443)
@@ -60,41 +61,95 @@ block_external_port() {
             return
             ;;
     esac
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw deny "${port}/tcp" >/dev/null 2>&1
-        echo "🛡️ 已通过 UFW 禁止外部直接访问 ${port} 端口"
-    elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+
+    # 1) UFW：必须插到规则链最前面（ufw deny 默认追加在 allow 之后，会被放行规则覆盖）
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        for i in 1 2 3; do ufw delete deny "${port}/tcp" >/dev/null 2>&1 || break; done
+        ufw insert 1 deny "${port}/tcp" >/dev/null 2>&1
+        echo "🛡️ UFW：已在规则链首部禁止外部访问 ${port}/tcp"
+    fi
+
+    # 2) Firewalld：移除放行并显式添加 drop rich rule
+    if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1
+        firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" port port=\"${port}\" protocol=\"tcp\" drop" >/dev/null 2>&1
+        firewall-cmd --permanent --add-rich-rule="rule family=\"ipv6\" port port=\"${port}\" protocol=\"tcp\" drop" >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
-        echo "🛡️ 已通过 Firewalld 移除外部对 ${port} 端口的放行"
-    elif command -v iptables &> /dev/null; then
-        # 允许本机回环通信，拦截外部访问该端口
-        iptables -C INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -i lo -p tcp --dport "${port}" -j ACCEPT
-        iptables -C INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || \
-            iptables -A INPUT -p tcp --dport "${port}" -j DROP
+        echo "🛡️ Firewalld：已移除 ${port}/tcp 的放行并添加 drop 规则"
+    fi
+
+    # 3) iptables/ip6tables：插入到 INPUT 链首部，避免被前置的 ACCEPT 规则提前放行
+    if command -v iptables &> /dev/null; then
+        for i in 1 2 3; do iptables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+        iptables -I INPUT 1 -p tcp --dport "${port}" -j DROP 2>/dev/null
+        for i in 1 2 3; do iptables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || break; done
+        iptables -I INPUT 1 -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
         if command -v ip6tables &> /dev/null; then
-            ip6tables -C INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || \
-                ip6tables -I INPUT -i lo -p tcp --dport "${port}" -j ACCEPT
-            ip6tables -C INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || \
-                ip6tables -A INPUT -p tcp --dport "${port}" -j DROP
+            for i in 1 2 3; do ip6tables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+            ip6tables -I INPUT 1 -p tcp --dport "${port}" -j DROP 2>/dev/null
+            for i in 1 2 3; do ip6tables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || break; done
+            ip6tables -I INPUT 1 -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
         fi
-        echo "🛡️ 已通过 iptables/ip6tables 禁止外部 IP:${port} 直接访问"
+        echo "🛡️ iptables：已在 INPUT 链首部拦截 ${port}/tcp（本机回环放行）"
+
+        # 4) Docker：容器端口经 nat/FORWARD 转发，不经过 INPUT，需在 DOCKER-USER 链拦截
+        if iptables -S DOCKER-USER &> /dev/null; then
+            for i in 1 2 3; do iptables -D DOCKER-USER -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+            iptables -I DOCKER-USER 1 -p tcp --dport "${port}" -j DROP 2>/dev/null
+            for i in 1 2 3; do iptables -D DOCKER-USER -i lo -j RETURN 2>/dev/null || break; done
+            iptables -I DOCKER-USER 1 -i lo -j RETURN 2>/dev/null
+            echo "🛡️ Docker：已在 DOCKER-USER 链拦截 ${port}/tcp（放行本机回环）"
+        fi
+    fi
+
+    # 5) 尽力持久化，避免重启后规则丢失
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save >/dev/null 2>&1 && echo "💾 规则已持久化（netfilter-persistent）"
+    elif [ -d /etc/iptables ]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null && echo "💾 规则已保存到 /etc/iptables/rules.v4"
+    fi
+
+    # 6) 后置自检：看后端究竟监听在哪个地址
+    local listen_addr=""
+    if command -v ss &> /dev/null; then
+        listen_addr=$(ss -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $4; exit}')
+    elif command -v netstat &> /dev/null; then
+        listen_addr=$(netstat -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ p {print $4; exit}')
+    fi
+    if printf '%s' "$listen_addr" | grep -qE '^(127\.|\[::1\]|::1)'; then
+        echo "✅ 自检：后端仅监听本机地址（${listen_addr}），外部本就无法直连。"
+    elif [ -n "$listen_addr" ]; then
+        echo "⚠️ 自检：后端监听在 ${listen_addr}（对外地址），已交由防火墙拦截。"
+        echo "💡 更彻底的做法是让服务改绑 127.0.0.1，或 Docker 映射写成 127.0.0.1:${port}:${port}。"
     fi
 }
 # 解除后端端口封禁（删除站点时调用）
 unblock_external_port() {
     local port=$1
+    local i
     [ -z "$port" ] && return
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw delete deny "${port}/tcp" >/dev/null 2>&1
-    elif command -v iptables &> /dev/null; then
-        iptables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null
-        iptables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
-        if command -v ip6tables &> /dev/null; then
-            ip6tables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null
-            ip6tables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
+    if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        for i in 1 2 3; do ufw delete deny "${port}/tcp" >/dev/null 2>&1 || break; done
+    fi
+    if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" port port=\"${port}\" protocol=\"tcp\" drop" >/dev/null 2>&1
+        firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv6\" port port=\"${port}\" protocol=\"tcp\" drop" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+    fi
+    if command -v iptables &> /dev/null; then
+        for i in 1 2 3; do iptables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+        for i in 1 2 3; do iptables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || break; done
+        if iptables -S DOCKER-USER &> /dev/null; then
+            for i in 1 2 3; do iptables -D DOCKER-USER -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+            for i in 1 2 3; do iptables -D DOCKER-USER -i lo -j RETURN 2>/dev/null || break; done
         fi
+        if command -v ip6tables &> /dev/null; then
+            for i in 1 2 3; do ip6tables -D INPUT -p tcp --dport "${port}" -j DROP 2>/dev/null || break; done
+            for i in 1 2 3; do ip6tables -D INPUT -i lo -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || break; done
+        fi
+    fi
+    if command -v netfilter-persistent &> /dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
     fi
 }
 # 列出当前对外封禁的端口
@@ -108,7 +163,9 @@ list_blocked_ports() {
             ufw status 2>/dev/null | awk '/^[0-9]+\/tcp[[:space:]]+DENY/ {split($1,a,"/"); print a[1]"|UFW DENY"}'
         fi
         if command -v iptables &> /dev/null; then
-            iptables -S INPUT 2>/dev/null | awk '/-j DROP/ {for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)"|iptables DROP"}'
+            for chan in INPUT DOCKER-USER; do
+                iptables -S "$chan" 2>/dev/null | awk -v c="$chan" '/-j DROP/ {for(i=1;i<=NF;i++) if($i=="--dport") print $(i+1)"|iptables "c}'
+            done
         fi
     } | sort -u)
     if [ -n "$lines" ]; then
@@ -121,10 +178,57 @@ list_blocked_ports() {
         echo "  (暂无封禁规则)"
     fi
     if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        echo "  ℹ️ Firewalld 模式通过移除放行实现，当前放行端口："
+        echo "  ℹ️ Firewalld 模式通过移除放行 + drop 规则实现，当前放行端口："
         echo "     $(firewall-cmd --list-ports 2>/dev/null)"
     fi
     echo "------------------------------------------"
+}
+# 端口封禁排障诊断
+diagnose_port_guard() {
+    echo ""
+    echo ">>> [端口封禁排障诊断]"
+    echo "── 1. 当前监听的 TCP 端口 ──"
+    if command -v ss &> /dev/null; then
+        ss -lntp 2>/dev/null | head -n 30
+    elif command -v netstat &> /dev/null; then
+        netstat -lntp 2>/dev/null | head -n 30
+    else
+        echo "(缺少 ss/netstat，无法列出监听端口)"
+    fi
+    echo "── 2. Docker 端口映射（若存在）──"
+    if command -v docker &> /dev/null; then
+        docker ps --format 'table {{.Names}}\t{{.Ports}}' 2>/dev/null | head -n 20
+    else
+        echo "(未安装 Docker)"
+    fi
+    echo "── 3. UFW 规则（带序号，注意顺序）──"
+    if command -v ufw &> /dev/null; then
+        ufw status numbered 2>/dev/null | head -n 20
+    else
+        echo "(未安装 UFW)"
+    fi
+    echo "── 4. iptables INPUT 前 15 条 ──"
+    if command -v iptables &> /dev/null; then
+        iptables -S INPUT 2>/dev/null | head -n 15
+    else
+        echo "(未安装 iptables)"
+    fi
+    echo "── 5. iptables DOCKER-USER ──"
+    if command -v iptables &> /dev/null; then
+        iptables -S DOCKER-USER 2>/dev/null || echo "(无 DOCKER-USER 链)"
+    fi
+    echo "── 6. Firewalld 放行端口 ──"
+    if command -v firewall-cmd &> /dev/null; then
+        firewall-cmd --list-ports 2>/dev/null || echo "(未运行)"
+    else
+        echo "(未安装 firewalld)"
+    fi
+    echo ""
+    echo "💡 判断要点："
+    echo "   1) 若端口由 Docker 映射（docker ps 中看到 0.0.0.0:端口->），必须走 DOCKER-USER 链或改绑 127.0.0.1；"
+    echo "   2) 若 UFW 里 allow 规则序号在 deny 之前，deny 不生效；"
+    echo "   3) 若 INPUT 前面已有 -A INPUT -j ACCEPT 之类规则，末尾的 DROP 不会命中；"
+    echo "   4) 云厂商安全组只是额外一层，不影响本机防火墙是否生效。"
 }
 # 解析用户输入的端口（支持空格/逗号分隔的多个端口）
 parse_ports() {
@@ -138,8 +242,9 @@ port_guard_menu() {
         echo "  1. 封禁端口 (禁止外部直连，仅允许本机 Nginx 转发)"
         echo "  2. 解除端口封禁"
         echo "  3. 查看当前封禁列表"
+        echo "  4. 排障诊断 (监听端口 + 防火墙规则)"
         echo "  0. 返回主菜单"
-        read -p "请选择操作 [0-3]: " PCH
+        read -p "请选择操作 [0-4]: " PCH
         case "$PCH" in
             1)
                 echo ""
@@ -179,11 +284,14 @@ port_guard_menu() {
                 echo ""
                 list_blocked_ports
                 ;;
+            4)
+                diagnose_port_guard
+                ;;
             0)
                 return
                 ;;
             *)
-                echo "❌ 无效选项，请输入 0 到 3 之间的数字。"
+                echo "❌ 无效选项，请输入 0 到 4 之间的数字。"
                 ;;
         esac
     done
