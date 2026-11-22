@@ -5,7 +5,8 @@
 ## 一键安装并运行
 
 ```bash
-sudo curl -fsSL https://githubusercontent.com -o /usr/local/bin/site && sudo chmod +x /usr/local/bin/site && sudo site
+sudo curl -fsSL https://raw.githubusercontent.com/wysadmin/nginx-site-manager/main/site.sh -o /usr/local/bin/site && sudo chmod 755 /usr/local/bin/site && sudo bash -n /usr/local/bin/site && sudo site
+
 ```
 
 ## 日常使用方法
