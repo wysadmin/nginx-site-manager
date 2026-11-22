@@ -1,6 +1,6 @@
 #!/bin/bash
 # Nginx 反向代理 & SSL 交互式管理工具
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 SCRIPT_URL="https://raw.githubusercontent.com/wysadmin/nginx-site-manager/main/site.sh"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
@@ -260,10 +260,16 @@ diagnose_port_guard() {
 parse_ports() {
     echo "$1" | tr ',' ' ' | tr -s ' \t' '\n' | grep -E '^[0-9]+$'
 }
-# 命中定位：用内核 LOG 判断数据包到底落在哪条链
+# 统计某条链里与指定端口相关的规则命中包数
+port_hit_count() {
+    local chain=$1
+    local p=$2
+    iptables -vnL "$chain" 2>/dev/null | awk -v p="$p" '$0 ~ ("dpt:" p) {s+=$1} END {print s+0}'
+}
+# 命中定位：用规则计数器判断数据包落在哪条链（不依赖 LOG/dmesg）
 trace_port_hits() {
     echo ""
-    echo ">>> [命中定位：判断数据包落在哪条链]"
+    echo ">>> [命中定位：用计数器判断数据包落在哪条链]"
     if ! command -v iptables &> /dev/null; then
         echo "❌ 缺少 iptables，无法定位。"
         return
@@ -275,34 +281,49 @@ trace_port_hits() {
         echo "❌ 端口无效。"
         return
     fi
-    local i
-    for i in 1 2 3; do iptables -D INPUT -p tcp --dport "${tport}" -j LOG --log-prefix "HIT-INPUT-${tport}: " 2>/dev/null || break; done
-    for i in 1 2 3; do iptables -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "${tport}" -j LOG --log-prefix "HIT-DU-${tport}: " 2>/dev/null || break; done
-    iptables -I INPUT 1 -p tcp --dport "${tport}" -j LOG --log-prefix "HIT-INPUT-${tport}: " --log-level 4 2>/dev/null
-    iptables -I DOCKER-USER 1 -p tcp -m conntrack --ctorigdstport "${tport}" -j LOG --log-prefix "HIT-DU-${tport}: " --log-level 4 2>/dev/null
-    echo "✅ 已在 INPUT 与 DOCKER-USER 埋点，请立即用另一台设备（手机流量）访问 IP:${tport}"
-    echo "⏳ 等待 8 秒后自动读取内核日志..."
-    sleep 8
-    local log
-    log=$((dmesg -T 2>/dev/null || dmesg 2>/dev/null) | grep -E "HIT-INPUT-${tport}|HIT-DU-${tport}" | tail -n 20)
-    echo "── 命中记录 ──"
-    if [ -z "$log" ]; then
-        echo "(没有任何命中)"
-        echo "❗ 说明数据包完全没经过本机 iptables（可能 host 网络模式 / macvlan / 其他网络命名空间）"
-        echo "💡 这种情况防火墙无解，唯一可靠做法是让服务只听 127.0.0.1"
-    else
-        echo "$log"
-        if echo "$log" | grep -q "HIT-DU-"; then
-            echo "ℹ️ 命中 DOCKER-USER：走 Docker DNAT 路径，conntrack 拦截规则应能生效"
-        fi
-        if echo "$log" | grep -q "HIT-INPUT-"; then
-            echo "ℹ️ 命中 INPUT：走主机监听路径，INPUT 的 DROP 应能生效"
-        fi
+    local in_before du_before in_after du_after
+    in_before=$(port_hit_count INPUT "$tport")
+    du_before=$(port_hit_count DOCKER-USER "$tport")
+    echo "── 埋点前：与 ${tport} 相关的规则及计数 ──"
+    iptables -vnL INPUT 2>/dev/null | grep -E "dpt:${tport}" || echo "  INPUT 中无该端口规则"
+    iptables -vnL DOCKER-USER 2>/dev/null | grep -E "dpt:${tport}" || echo "  DOCKER-USER 中无该端口规则"
+    echo "👉 请在 10 秒内用手机流量访问 IP:${tport}（多刷新几次）"
+    sleep 10
+    in_after=$(port_hit_count INPUT "$tport")
+    du_after=$(port_hit_count DOCKER-USER "$tport")
+    echo "── 访问后：计数变化 ──"
+    iptables -vnL INPUT 2>/dev/null | grep -E "dpt:${tport}" || echo "  INPUT 中无该端口规则"
+    iptables -vnL DOCKER-USER 2>/dev/null | grep -E "dpt:${tport}" || echo "  DOCKER-USER 中无该端口规则"
+    local d_in d_du
+    d_in=$(( in_after - in_before ))
+    d_du=$(( du_after - du_before ))
+    echo "ℹ️ 本次新增命中：INPUT +${d_in}，DOCKER-USER +${d_du}"
+    echo ""
+    if [ "$d_in" -gt 0 ]; then
+        echo "✅ 流量走了 INPUT：docker-proxy 在宿主机监听（userland proxy 模式），INPUT 的 DROP 才会生效"
+        echo "   若此刻仍能访问，说明 INPUT 里有更靠前的 ACCEPT，或规则被其他管理器（面板/fail2ban）重写"
     fi
-    # 清理埋点，避免日志刷屏
-    for i in 1 2 3; do iptables -D INPUT -p tcp --dport "${tport}" -j LOG --log-prefix "HIT-INPUT-${tport}: " 2>/dev/null || break; done
-    for i in 1 2 3; do iptables -D DOCKER-USER -p tcp -m conntrack --ctorigdstport "${tport}" -j LOG --log-prefix "HIT-DU-${tport}: " 2>/dev/null || break; done
-    echo "🧹 埋点规则已清理。"
+    if [ "$d_du" -gt 0 ]; then
+        echo "✅ 流量走了 DOCKER-USER：走 DNAT 转发，必须用 conntrack 原始目标端口拦截"
+    fi
+    if [ "$d_in" -eq 0 ] && [ "$d_du" -eq 0 ]; then
+        echo "❗ 两条链都没有命中，按下面几项继续排查："
+        echo "   1) iptables 变体: $(iptables --version 2>/dev/null)"
+        if command -v nft &> /dev/null; then
+            echo "   2) nft 规则集里是否有相关条目（legacy/nft 混用会导致写进去的规则不生效）:"
+            nft list ruleset 2>/dev/null | grep -iE "docker|${tport}" | head -n 6 || echo "      (nft 中无相关规则)"
+        fi
+        local dmesg_state
+        if dmesg >/dev/null 2>&1; then
+            dmesg_state="可读"
+        else
+            dmesg_state="不可读（LOG 方案会失效，改用 journalctl -k）"
+        fi
+        echo "   3) dmesg 可读性: ${dmesg_state}"
+        echo "   4) 是否有面板类防火墙在周期性重写规则（若存在，它可能把自定义规则清掉）:"
+        systemctl list-units --type=service 2>/dev/null | grep -iE 'firewall|panel|fail2ban' | head -n 5 || echo "      (未发现明显相关服务)"
+    fi
+    echo "💡 结论优先级：若两条链都不命中，最稳的做法是让容器只监听本机：ports 改成 \"127.0.0.1:${tport}:${tport}\""
 }
 # 对外端口封禁管理（独立功能）
 port_guard_menu() {
